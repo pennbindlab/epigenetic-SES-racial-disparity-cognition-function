@@ -1,0 +1,908 @@
+---
+title: "Epigenetic age and socioeconomic status contribute to racial disparities in cognitive and functional aging between Black and White older Americans"
+date: 2023
+author: "Isabel Yannatos"
+output:
+  word_document: default
+---
+
+This code was used to produce the analyses and results in paper: [medrxiv link]
+
+Data can be downloaded from the Health and Retirement Study website: https://hrs.isr.umich.edu/data-products
+
+Data folders needed:
+- randhrs1992_2020v1_SPSS https://hrsdata.isr.umich.edu/data-products/rand-hrs-longitudinal-file-2020
+- trk2020v3 https://hrsdata.isr.umich.edu/data-products/cross-wave-tracker-file 
+- CogImp2020 https://hrsdata.isr.umich.edu/data-products/cross-wave-imputation-cognitive-functioning-measures-1992-2020 
+- EPIGENETIC https://hrsdata.isr.umich.edu/data-products/epigenetic-clocks 
+
+Make sure to set working directory (line 67) before knitting
+
+```{r setup, include=FALSE}
+RequiredPackages <- c("tidyverse","haven","knitr","gtsummary","flextable","Hmisc","modelr","survey","cowplot","lsr","broom", "ggdag")
+for (i in RequiredPackages) { #Installs packages if not yet installed
+    if (!require(i, character.only = TRUE)) install.packages(i)
+}
+library(tidyverse)
+library(haven)
+library(knitr)
+library(gtsummary)
+library(flextable)
+library(Hmisc)
+library(modelr)
+library(survey)
+library(CMAverse)
+library(cowplot)
+library(lsr)
+library(broom)
+library(dagitty)
+library(ggdag)
+set.seed(2023)
+
+options(na.action = na.warn,
+        digits = 2, scipen = 10)
+knitr::opts_chunk$set(warning = FALSE, echo = FALSE, message = FALSE)
+
+MultipleComparisons <- 4
+regression_theme <- list(
+  # package-wide: suppress message
+  "pkgwide-lgl:quiet" = TRUE,
+  #regression tables format
+  "tbl_regression-fn:addnl-fn-to-run" = function (x) add_significance_stars(x, pattern = "{estimate}{stars}\n({conf.low},{conf.high})", thresholds = c(.001/MultipleComparisons, .01/MultipleComparisons, .05/MultipleComparisons), hide_se = TRUE)
+)
+set_gtsummary_theme(regression_theme)
+set_flextable_defaults(digits = 2, font.size = 10, padding.bottom=0, padding.top=0, padding.left = 0, padding.right = 0)
+
+theme_set(theme_bw(base_size = 12) +
+            theme(axis.text.y = element_text(color = "black"),
+                  axis.text.x = element_text(color = "black"),
+                  axis.title.y = element_text(face = "plain"),
+                  axis.title.x = element_text(face = "plain"),
+                  legend.title = element_text(face = "bold"),
+                  title = element_text(face = "bold"),
+                  legend.background = element_rect(color = 1, linewidth = 0.2),
+                  legend.key.height = unit(25, "point"),
+                  strip.background = element_blank(), 
+                  strip.text = element_text(face = "bold")))
+```
+
+```{r import}
+##--------------------------Import Data---------------------------------------##
+#Set working directory:  
+setwd("~/Desktop/BiND_Paper 2/Final code")  ######!!!!!!! Change this!!!!!!!
+
+# randhrs1992_2020v1 is the RAND cross-wave data file. Contains demographics, SES, IADL, health behaviors, and health status data. Identified by HHIDPN.
+randhrs1992_2020v1 <- read_sav("randhrs1992_2020v1_SPSS/randhrs1992_2020v1.sav",
+                               col_select =  c(HHIDPN, R13AGEM_E, RAGENDER, RAHISPAN, RARACEM, RAEDYRS, H12ITOT, H12ATOTB, H12HHRES, R13IADL5A, R14IADL5A, R13IWSTAT, R12SMOKEV, R12SMOKEN, R12DRINK, R12DRINKN, R12VGACTX, R12MDACTX, R12SHLT, R12CESD, R12HIBPE, R12DIABE, R12CANCRE, R12LUNGE, R12HEARTE, R12STROKE, R12ARTHRE))
+rand <- filter(randhrs1992_2020v1, R13IWSTAT == 1)
+
+# trk2020tr_r is the updated tracker file. Contains weights. Identified by HHID (in a different format, 8 digits instead of 6) + PN
+trk2020tr_r <- read_sav("trk2020v3/trk2020tr_r.sav", encoding = "latin1",
+                        col_select = c(HHID, PN, VBSI16WGTRA))
+#create HHIDPN in tracker and select variables
+trk2020 <- mutate(trk2020tr_r, HHIDPN = as.numeric(str_sub(HHID,1,6))*1000 + as.numeric(PN), .keep="unused")
+
+#2020 cross-wave imputed cognitive measures
+COGIMP9220A_R <- read_sav("CogImp2020/COGIMP9220A_R.SAV", col_select = c(HHID, PN, R14COGMODE, R15COGMODE, starts_with("R") & contains(c("TR20","SER7","BWC20"))))
+TICS_all <- mutate(COGIMP9220A_R, HHIDPN = as.numeric(HHID)*1000 + as.numeric(PN), .keep = "unused")
+
+# EPICLOCKA_R contains epigenetic clock values. Identified by HHID+PN
+EPICLOCKA_R <- read_sav("EPIGENETIC/EPICLOCKA_R.sav", col_select = c(HHID, PN, DNAMGRIMAGE, MPOA)) %>%
+  mutate(HHIDPN = as.numeric(HHID)*1000 + as.numeric(PN), .keep = "unused") #Create HHIDPN
+
+#merge with weights and covariate data
+epiclocks <- rename(EPICLOCKA_R, "GrimAge" = "DNAMGRIMAGE", "DPoAm" = "MPOA") %>%
+  left_join(trk2020, by = "HHIDPN") %>%
+  left_join(rand, by = "HHIDPN")
+```
+
+```{r covariates}
+##---------------------Set up demographics and SES---------------------------##
+epiclocks <- rename(epiclocks, "Income" = "H12ITOT", "Wealth" = "H12ATOTB") %>%
+  mutate(
+    # Adjust income for number of people in household. This adjustment does not take into account # of children vs adults. Could use H13POVFAM to do a more nuanced adjustment
+    IncomeAdjusted = Income/(H12HHRES^0.5),
+      #Log income and wealth and take Z-score
+    IncomeAdjustedZ = scale(log(IncomeAdjusted + 1 + abs(min(IncomeAdjusted, na.rm = TRUE))), center = TRUE, scale = TRUE),
+    WealthZ = scale(log(Wealth + 1 + abs(min(Wealth, na.rm = TRUE))), center = TRUE, scale = TRUE),
+    SES_adjusted = (WealthZ + IncomeAdjustedZ)/2,
+    #Re-code gender
+    Gender = recode_factor(as_factor(RAGENDER), "1.Male" = "Male", "2.Female" = "Female"),
+    Age = R13AGEM_E / 12)
+#Use weighted quartiles to categorize SES Index. Use highest quartile as the reference group
+epiclocks$IndexAdjusted <- as.factor(cut(epiclocks$SES_adjusted, breaks=wtd.quantile(epiclocks$SES_adjusted, weights = epiclocks$VBSI16WGTRA), labels =FALSE, include.lowest = TRUE)) %>% 
+  fct_rev()
+
+#Re-code race and ethnicity. Hispanic includes 344 white, 16 Black, 196 other
+epiclocks$RaceEthnicity <- if_else(epiclocks$RAHISPAN == 1, "Hispanic", 
+                              if_else(epiclocks$RARACEM == 1, "White", 
+                                      if_else(epiclocks$RARACEM == 2, "Black", "Other")))
+epiclocks$RaceEthnicity <- as.factor(epiclocks$RaceEthnicity) %>%
+  fct_relevel("White", "Black", "Hispanic", "Other")
+
+#Categorize education
+epiclocks$Education <- as.factor(epiclocks$RAEDYRS) %>%
+  fct_collapse(
+    "College +" = c("16","17"),
+    "Some College" = c("13","14","15"),
+    "High School" = c("12"),
+    "< High School" = c("0","1","2","3","4","5","6","7","8","9","10","11")
+  ) %>% fct_rev()
+
+##-------------------------Set up health-------------------------------------##
+#Re-code smoking. SMOKEV is ever smoked? SMOKEN is smoke now?
+epiclocks$Smoke <- if_else(epiclocks$R12SMOKEV == 0, "Never",
+                      if_else(epiclocks$R12SMOKEN == 1, "Current",
+                              if_else(epiclocks$R12SMOKEV == 1 & epiclocks$R12SMOKEN == 0, "Past",
+                                      NA_character_)))
+epiclocks$Smoke <- as.factor(epiclocks$Smoke) %>%
+  fct_relevel("Never", "Past", "Current")
+
+#Re-code drinking. DRINK is do you ever drink? DRINKN is if yes, how many drinks do you have on days you drink in the last 3 months?
+epiclocks$Drink <- if_else(epiclocks$R12DRINK == 0, "None",
+                      if_else(epiclocks$R12DRINKN <= 2, "Moderate",
+                              if_else(epiclocks$R12DRINKN > 2, "Heavy", NA_character_)))
+epiclocks$Drink <- as.factor(epiclocks$Drink) %>%
+  fct_relevel("None", "Moderate", "Heavy")
+
+#Exercise. Reverse code, then take highest score of either moderate or vigorous exercise.
+# 5= never, 4 = 1-3x per month, 3 = 1x per week, 2= >1x per week, 1 = every day
+epiclocks <- mutate(epiclocks, VigAct = 5 - R12VGACTX, ModAct = 5 - R12MDACTX,
+               Activity = pmax(VigAct, ModAct, na.rm = TRUE))
+
+#Chronic conditions. Sum of doctor diagnosed conditions, out of 6 possible
+epiclocks <- mutate(epiclocks, Chronic6 = as.numeric(R12HIBPE + R12DIABE + R12CANCRE + R12LUNGE + R12HEARTE + R12ARTHRE),
+               #Stroke history 
+               Stroke = as.factor(R12STROKE),
+               #Self-rated health
+               SelfRatedHealth = as.factor(epiclocks$R12SHLT)) %>% 
+  #Depression symptoms
+  rename("CESD" = "R12CESD") %>% mutate(CESD = as.numeric(CESD))
+#self-rated health: 1=excellent, 2 = very good, 3=good, 4=fair, 5=poor. Dichotomize
+epiclocks$SelfRatedHealth <- fct_collapse(epiclocks$SelfRatedHealth, 
+                                "Good/Great" = c("1","2","3"),
+                                "Fair/Poor" = c("4", "5"))
+```
+
+```{r TICScalculation, include = FALSE}
+##-----------------------------Calculate TICS---------------------------------##
+#TR20 is total word recall (immediate and delayed, 0-20). SER7 is serial 7's, 0-5. BWC20 is backward count from 20, 0-2.
+#pivot longer so each wave is a separate row and sum across each row
+TICS_all <- pivot_longer(TICS_all, cols = -HHIDPN, names_to = c("wave", ".value"), names_pattern = "R(\\d+)(.*)", values_drop_na = TRUE) %>%
+  #When TICS was done digitally COGMODE = 2 and use Web variables for TR and BWC. Only applies to waves 14 and 15
+  mutate(TICS = case_when(COGMODE == 2 ~ TR20W + SER7W + BWC20W,
+                          COGMODE == 1 ~ TR20P + SER7P + BWC20P,
+                          TRUE ~ TR20 + SER7 + BWC20),
+         wave = as.numeric(wave)) %>%
+  filter(!is.na(TICS)) %>%
+  #number of data points for each participant
+  group_by(HHIDPN) %>% 
+  mutate(NumWaves = n()) %>%
+  ungroup() %>%
+  #only waves 13 - 15
+  filter(wave > 12) %>%
+  select(HHIDPN, COGMODE, TICS, wave, NumWaves) %>%
+  pivot_wider(id_cols = HHIDPN, names_from = wave, values_from = c(TICS, COGMODE, NumWaves)) %>%
+  #TICS change from 2016 to 2018
+  mutate(TICSdifference = TICS_14 - TICS_13,
+         MissingTICSChange = is.na(TICSdifference)) %>%
+  #TICS score in 2016
+  rename("TICSperformance" = "TICS_13") %>%
+  select(-COGMODE_13, -NumWaves_14) 
+```
+
+```{r IADLs, include = FALSE}
+##-----------------------------Set up IADLs---------------------------------##
+epiclocks <- mutate(epiclocks, 
+                    #Prevalence: presence or absence of limitation in 2016
+                    IADLprevalence = if_else(R13IADL5A > 0, TRUE, FALSE),
+                    #Incidence: exclude prevalent cases. Whether new limitation in 2018
+                    IADLincidence = case_when(
+                      IADLprevalence ~ NA,
+                      R14IADL5A > 0 ~ TRUE,
+                      R14IADL5A == 0 ~ FALSE),
+                    Prevalence = as_factor(IADLprevalence),
+                    Incidence = as_factor(IADLincidence),
+                    MissingIncidence = is.na(Incidence)) %>%
+  rename("IADL2016" = "R13IADL5A",
+         "IADL2018" = "R14IADL5A")
+
+```
+
+# Methods
+
+We impute missing sample weights (N=`r nrow(filter(epiclocks, is.na(VBSI16WGTRA)))` missing) using the mean value and include weighting in all analyses.
+
+```{r AgeAccelRegress, include = FALSE}
+##---------------Impute missing sample weights--------------------------------##
+#change missing values to mean
+epiclocks$VBSI16WGTRA[is.na(epiclocks$VBSI16WGTRA)] <- mean(epiclocks$VBSI16WGTRA, na.rm = T)
+#Scale so that sum of weights = sample size. For mediation analyses
+epiclocks <- mutate(epiclocks, 
+                        ScaleWeights = VBSI16WGTRA*length(HHIDPN)/sum(VBSI16WGTRA))
+
+##-------------Calculate DNAm age acceleration--------------------------------##
+# Using full N=4018 data set. weighted and scaled.
+#GrimAge
+epiclocks <- add_residuals(epiclocks, model = lm(GrimAge ~ Age, weights = VBSI16WGTRA, data = epiclocks), var = "GrimAge_resid") %>%
+  mutate(GrimAge_resid = as.numeric(scale(GrimAge_resid, center = F, scale = T)))
+
+#Dunedin
+epiclocks <- add_residuals(epiclocks, model = lm(DPoAm ~ Age, weights = VBSI16WGTRA, data = epiclocks), var = "DPoAm_resid") %>%
+  mutate(DPoAm_resid = as.numeric(scale(DPoAm_resid, center = F, scale = T)))
+```
+
+```{r merge}
+##------------------Merge and filter data-------------------------------------##
+epiclocks_all <- left_join(epiclocks, TICS_all, by = "HHIDPN") %>%
+  #residual of TICS decline from TICS score (for mediation)
+  mutate(Declineadjusted = resid(lm(TICSdifference ~ TICSperformance, data = ., weights= VBSI16WGTRA)),
+         #Mark cases missing demographic or SES data
+         Missing = !complete.cases(select(., Gender, RaceEthnicity, Education, IndexAdjusted))) %>%
+  select(- starts_with("R13"), - starts_with("RA", ignore.case = F)) %>%
+  filter(RaceEthnicity == "White" | RaceEthnicity == "Black") %>%
+  droplevels() %>% rename("Race" = "RaceEthnicity")
+
+save(epiclocks_all, file = "Yannatosetal_Dataset.rda")
+```
+
+```{r load}
+#load("Yannatosetal_Dataset.rda")
+##-------------------------Complete cases-------------------------------------##
+epiclocks_complete <- filter(epiclocks_all, !Missing)
+
+#For mediation analyses: only cases not missing outcomes
+epiclocks_decline <- filter(epiclocks_complete, !MissingTICSChange)
+epiclocks_incidence <- filter(epiclocks_complete, !MissingIncidence)
+```
+
+## Population
+
+We include `r nrow(epiclocks_complete)` participants in the HRS DNAm subsample who self-identify as non-Hispanic White (N=`r nrow(filter(epiclocks_complete, Race == "White"))`) or non-Hispanic Black (N=`r nrow(filter(epiclocks_complete, Race == "Black"))`).  Inclusion criteria were having a DNAm measurement that passed quality control (N=4018) and identifying as non-Hispanic and White or Black (N=`r nrow(epiclocks_all)`). Exclusion criteria were missing demographic and socioeconomic status (SES) data (education, wealth or income, N=`r nrow(filter(epiclocks_all, Missing))`).
+
+## Outcomes
+
+`r nrow(filter(epiclocks_complete, MissingTICSChange))` participants are missing 2018 TICS data and are excluded from analyses using the longitudinal outcome.
+
+`r nrow(filter(epiclocks_complete, IADLprevalence))` have prevalent IADL limitation and an additional `r nrow(filter(epiclocks_complete, MissingIncidence & !IADLprevalence))` are missing 2018 IADL data and are excluded from analyses on IADL limitation incidence.
+
+## Analytic approach
+
+```{r Fig1DAG, fig.height=2.5, fig.width=3.4}
+##-----------------------------Figure 1: DAG----------------------------------##
+#Use dagitty package to set up DAG
+DAGITTY <- dagitty('dag {
+  Race [exposure, pos="0,1"]
+  "Age, Gender" [pos="0.2,1.07"]
+  "Education, Wealth/Income" [pos="0.7,0.9"]
+  "Epigenetic age gap" [pos="1,1.1"]
+  "Cognitive and" [pos="1.75,1.005"]
+  "functional outcomes" [pos="1.75,0.995"]
+  "" [pos ="1.25,1"]
+
+  " " [pos = "2.1,1"]
+  Race -> "Education, Wealth/Income" -> "Epigenetic age gap" -> "Cognitive and"
+  "Age, Gender" -> "Education, Wealth/Income" -> "functional outcomes"
+  Race -> "Epigenetic age gap"
+  Race -> ""
+  "Age, Gender" -> "Cognitive and"
+  "Age, Gender" -> "Epigenetic age gap"
+}')
+#use ggdag package to print figure
+ggdag_classic(DAGITTY, size = 3) + 
+  theme_dag_blank()
+
+ggsave("Fig1.tiff", height = 2.5, width = 3.4, units ="in", dpi = 300, bg = "white")
+```
+
+*Fig 1. Directed acyclic graph showing relationships between variables.* Through various forms of racism, race is associated with SES (education, income, and wealth), epigenetic age gap, and with cognitive and functional outcomes as evidenced by racial disparities in these measures. Age, gender, and SES are important confounders since they are associated with both epigenetic age gap and these outcomes. We hypothesize an association between epigenetic age gap and both cognitive and functional outcomes.
+
+# Results
+
+Overall, the sample is `r round(mean(epiclocks_complete$Age),1)` years old on average, `r round(nrow(filter(epiclocks_complete, Gender == "Male"))*100/nrow(epiclocks_complete),1)`% men, and `r round(nrow(filter(epiclocks_complete, Race == "White"))*100/nrow(epiclocks_complete),1)`% White.
+
+```{r table1, results='asis'}
+##---------------------------Table 1------------------------------------------##
+#Set labels for variables
+Labels <- list(starts_with('Age') ~ "Age", contains('Gender') ~ "Gender", contains('TICSperformance') ~ "TICS score", contains('TICSdifference') ~ "Change in TICS score", contains('IADLprevalence') ~ "IADL limitation prevalence", contains('IADLincidence') ~ "IADL limitation incidence", starts_with('GrimAge') ~ "GrimAge gap", starts_with('DPoAm') ~ "DPoAm gap", contains('Index') ~ "Wealth/Income Quartile",
+               contains('IADL2016') ~ "IADL 2016", contains('IADL2018') ~ "IADL 2018",
+               contains('Activity') ~ "Physical activity frequency", contains('Smoke') ~ "Tobacco smoking", contains('Drink') ~ "Alcohol consumption", contains('CESD') ~ "Depression symptoms", contains('Chronic') ~ "# Chronic conditions", contains('SelfRatedHealth') ~ "Self-rated health")
+
+# Measures of effect size
+CohensD <- function(data, variable, by, ...) {
+  cohensD(data = data, as.formula(glue::glue("{variable} ~ {by}")), method = "unequal")
+}
+CramersV <- function(data, variable, by, ...) {
+  cramersV(table(data[[variable]], data[[by]]))
+}
+#produce table using gtsummary functions
+tbl_summary(epiclocks_complete, by = Race, include = c(Age, Gender, TICSperformance, TICSdifference, IADLprevalence, IADLincidence, GrimAge_resid, DPoAm_resid, Education, IndexAdjusted), label = Labels,
+            type = list(where(is.numeric) ~ "continuous"), statistic = list(all_continuous() ~ "{mean} ({sd})"), digits = list(all_continuous() ~ 2)) %>% 
+  add_overall() %>% add_p() %>% bold_labels() %>%
+  #Add effect size column
+  add_stat(fns = list(all_continuous() ~ CohensD, all_categorical() ~ CramersV)) %>% modify_header(add_stat_1 ~ "Effect Size") %>% modify_footnote(add_stat_1 ~ "Cohen's D; Cramer's V") %>%
+  modify_caption("Table 1: Sample characteristics by race.") %>%
+  #print table using flextable
+  as_flex_table() %>% bold(part = "header") %>% fontsize(size = 10, part = "all") 
+  # set_table_properties(layout = 'autofit')
+```
+
+## Regression models: association of epigenetic age gap with cognitive and functional outcomes
+
+```{r Regression}
+##------------------------function to perform TICS regressions----------------##
+TICSRegResults <- function(outcome) {
+  #Set up basic models without epigenetic age gap
+  if(outcome == "TICS Score") {
+  Model0 <- lm(TICSperformance ~ Age + Gender + Race, epiclocks_complete, weights = VBSI16WGTRA)
+  }
+  if(outcome == "TICS Change") {
+  Model0 <- lm(TICSdifference ~ Age + Gender + Race + TICSperformance, epiclocks_complete, weights = VBSI16WGTRA)
+  }
+  # SES models: add education and wealth/income
+  Model1 <- update(Model0, . ~ . + Education + IndexAdjusted)
+  
+  #store results of models in tables
+  tbl0 <- tidy(Model0, conf.int = TRUE) %>% mutate(Model = "Basic", Clock = "None")
+  tbl1 <- tidy(Model1, conf.int = TRUE) %>% mutate(Model = "SES", Clock = "None")
+  
+  #Models with epigenetic age gap
+  Grim0 <- tidy(update(Model0, . ~ . + GrimAge_resid), conf.int = TRUE) %>%
+    mutate(Model = "Basic", Clock = "GrimAge")
+  Grim1 <- tidy(update(Model1, . ~ . + GrimAge_resid), conf.int = TRUE) %>%
+    mutate(Model = "SES", Clock = "GrimAge")
+  Dune0 <- tidy(update(Model0, . ~ . + DPoAm_resid), conf.int = TRUE) %>%
+    mutate(Model = "Basic", Clock = "DPoAm")
+  Dune1 <- tidy(update(Model1, . ~ . + DPoAm_resid), conf.int = TRUE) %>%
+    mutate(Model = "SES", Clock = "DPoAm")
+  
+  #combine tables
+  rbind(tbl0,tbl1,Grim0,Grim1,Dune0,Dune1) %>% mutate(Outcome = outcome)
+}
+
+##--------------------function to perform IADL regressions--------------------##
+#Use survey package to correctly account for weights
+SurveyData <- select(epiclocks_complete, IADLprevalence, IADLincidence, Race, GrimAge_resid, DPoAm_resid, Age, Gender, Education, IndexAdjusted, Smoke, Drink, Activity, SelfRatedHealth, CESD, Chronic6, Stroke, VBSI16WGTRA)
+Design <- svydesign(ids = ~0, weights = ~VBSI16WGTRA, data = SurveyData)
+
+IADLRegResults <- function(outcome) {
+  #set up basic models
+  if(outcome == "IADL Prevalence") {
+  Model0 <- svyglm(IADLprevalence ~ Age + Gender + Race, design = Design, family = "binomial")
+  }
+    if(outcome == "IADL Incidence") {
+  Model0 <- svyglm(IADLincidence ~ Age + Gender + Race, design = Design, family = "binomial", na.action = na.omit)
+    }
+  #SES models: add education and wealth/income
+  Model1 <- update(Model0, . ~ . + Education + IndexAdjusted)
+  
+  #Store results in tables
+  tbl0 <- tidy(Model0, conf.int = TRUE, exponentiate = TRUE) %>% mutate(Model = "Basic", Clock = "None")
+  tbl1 <- tidy(Model1, conf.int = TRUE, exponentiate = TRUE) %>% mutate(Model = "SES", Clock = "None")
+  
+  #Add epigenetic age gap
+  Grim0 <- tidy(update(Model0, . ~ . + GrimAge_resid), conf.int = TRUE, exponentiate = TRUE) %>%
+    mutate(Model = "Basic", Clock = "GrimAge")
+  Grim1 <- tidy(update(Model1, . ~ . + GrimAge_resid), conf.int = TRUE, exponentiate = TRUE) %>%
+    mutate(Model = "SES", Clock = "GrimAge")
+  Dune0 <- tidy(update(Model0, . ~ . + DPoAm_resid), conf.int = TRUE, exponentiate = TRUE) %>%
+    mutate(Model = "Basic", Clock = "DPoAm")
+  Dune1 <- tidy(update(Model1, . ~ . + DPoAm_resid), conf.int = TRUE, exponentiate = TRUE) %>%
+    mutate(Model = "SES", Clock = "DPoAm")
+  #combine tables 
+  rbind(tbl0,tbl1,Grim0,Grim1,Dune0,Dune1) %>% mutate(Outcome = outcome)
+}
+
+##-------------------Run TICS and IADL regressions---------------------------##
+RegressionResults <- rbind(TICSRegResults("TICS Score"),TICSRegResults("TICS Change"),IADLRegResults("IADL Prevalence"),IADLRegResults("IADL Incidence")) %>%
+  mutate(Clock = as.factor(Clock))
+
+```
+
+```{r Fig2, fig.height = 4.5, fig.width = 3.4}
+##----------------------------figure 2----------------------------------------##
+#Plot coefficient of epigenetic age gap for each outcome, clock, and model
+DNAmResults <- filter(RegressionResults, term == "GrimAge_resid" | term == "DPoAm_resid")
+#Plot TICS and IADL coefficients separately because of different y axis scales
+TICSAssociations <- ggplot(filter(DNAmResults, Outcome == "TICS Score" | Outcome == "TICS Change")) +
+  geom_pointrange(aes(y = estimate, ymin = conf.low, ymax = conf.high, x = Clock, linetype = Model, shape = Model, color = Clock),
+                  position = position_dodge(width = 0.4)) +
+  geom_hline(aes(yintercept = 0), size = 1) +
+  scale_shape_manual(values=c(16,1)) +
+  scale_color_brewer(type= "qual") +
+  scale_y_reverse() + scale_x_discrete(limits = c("GrimAge","DPoAm")) +
+  labs(x = element_blank(), y = "Beta (TICS points)") +
+  facet_wrap(~factor(Outcome, levels=c("TICS Score","TICS Change")), nrow= 1) +
+  theme(legend.position = "none")
+
+IADLAssociations <- ggplot(filter(DNAmResults, Outcome == "IADL Prevalence" | Outcome == "IADL Incidence")) +
+  geom_pointrange(aes(y = estimate, ymin = conf.low, ymax = conf.high, x = Clock, linetype = Model, shape = Model, color = Clock),
+                  position = position_dodge(width = 0.4)) +
+  geom_hline(aes(yintercept = 1), size = 1) +
+  scale_shape_manual(values=c(16,1)) +
+  scale_color_brewer(type = "qual") +
+  scale_x_discrete(limits = c("GrimAge","DPoAm")) +
+  guides(color = FALSE) +
+  labs(x = element_blank(), y = "Odds Ratio") +
+  facet_wrap(~factor(Outcome, levels=c("IADL Prevalence","IADL Incidence")), nrow= 1) +
+  theme(legend.position = "bottom")
+
+plot_grid(TICSAssociations, IADLAssociations, nrow = 2, align = "v", rel_heights = c(1,1.3), labels = "AUTO")
+
+ggsave(file = "Fig2.tiff", height = 4.5, width = 3.4, units = 'in', dpi = 300)
+```
+
+*Fig 2. Associations between epigenetic age gap and outcomes.* Points represent the magnitude of the association and lines represent 95% confidence intervals. Basic models, adjusted for race, age and gender, are shown with solid points and lines; SES models, which include education and wealth/income, are shown with empty points and dashed lines.The coefficients of GrimAge and DPoAm gaps with outcomes A) TICS score and TICS change, B) IADL limitation prevalence and IADL limitation incidence are plotted.
+
+Basic models:
+
+Full results of TICS score models are shown in eTable 1; coefficient values are GrimAge $\beta$ = `r filter(DNAmResults, Model == "Basic" & Outcome == "TICS Score" & Clock =="GrimAge")$estimate`, 95% CI `r filter(DNAmResults, Model == "Basic" & Outcome == "TICS Score" & Clock =="GrimAge")$conf.low`, `r filter(DNAmResults, Model == "Basic" & Outcome == "TICS Score" & Clock =="GrimAge")$conf.high`; DPoAm $\beta$ = `r filter(DNAmResults, Model == "Basic" & Outcome == "TICS Score" & Clock =="DPoAm")$estimate`, 95% CI `r filter(DNAmResults, Model == "Basic" & Outcome == "TICS Score" & Clock =="DPoAm")$conf.low`, `r filter(DNAmResults, Model == "Basic" & Outcome == "TICS Score" & Clock =="DPoAm")$conf.high`. 
+TICS change models are shown in Table S2; coefficient values are GrimAge $\beta$ = `r filter(DNAmResults, Model == "Basic" & Outcome == "TICS Change" & Clock =="GrimAge")$estimate`, 95% CI `r filter(DNAmResults, Model == "Basic" & Outcome == "TICS Change" & Clock =="GrimAge")$conf.low`, `r filter(DNAmResults, Model == "Basic" & Outcome == "TICS Change" & Clock =="GrimAge")$conf.high`; DPoAm $\beta$ = `r filter(DNAmResults, Model == "Basic" & Outcome == "TICS Change" & Clock =="DPoAm")$estimate`, 95% CI `r filter(DNAmResults, Model == "Basic" & Outcome == "TICS Change" & Clock =="DPoAm")$conf.low`, `r filter(DNAmResults, Model == "Basic" & Outcome == "TICS Change" & Clock =="DPoAm")$conf.high`. 
+
+IADL limitation prevalence models are shown in Table S3; coefficient values are GrimAge odds ratio (OR) = `r filter(DNAmResults, Model == "Basic" & Outcome == "IADL Prevalence" & Clock =="GrimAge")$estimate`, 95% CI `r filter(DNAmResults, Model == "Basic" & Outcome == "IADL Prevalence" & Clock =="GrimAge")$conf.low`, `r filter(DNAmResults, Model == "Basic" & Outcome == "IADL Prevalence" & Clock =="GrimAge")$conf.high`; DPoAm OR = `r filter(DNAmResults, Model == "Basic" & Outcome == "IADL Prevalence" & Clock =="DPoAm")$estimate`, 95% CI `r filter(DNAmResults, Model == "Basic" & Outcome == "IADL Prevalence" & Clock =="DPoAm")$conf.low`, `r filter(DNAmResults, Model == "Basic" & Outcome == "IADL Prevalence" & Clock =="DPoAm")$conf.high`.
+IADL limitation incidence models are shown in Table S4; coefficient values are GrimAge OR = `r filter(DNAmResults, Model == "Basic" & Outcome == "IADL Incidence" & Clock =="GrimAge")$estimate`, 95% CI `r filter(DNAmResults, Model == "Basic" & Outcome == "IADL Incidence" & Clock =="GrimAge")$conf.low`, `r filter(DNAmResults, Model == "Basic" & Outcome == "IADL Incidence" & Clock =="GrimAge")$conf.high`; DPoAm OR = `r filter(DNAmResults, Model == "Basic" & Outcome == "IADL Incidence" & Clock =="DPoAm")$estimate`, 95% CI `r filter(DNAmResults, Model == "Basic" & Outcome == "IADL Incidence" & Clock =="DPoAm")$conf.low`, `r filter(DNAmResults, Model == "Basic" & Outcome == "IADL Incidence" & Clock =="DPoAm")$conf.high`.
+
+SES Models:
+
+Coefficient values for TICS score are GrimAge $\beta$ = `r filter(DNAmResults, Model == "SES" & Outcome == "TICS Score" & Clock =="GrimAge")$estimate`, 95% CI `r filter(DNAmResults, Model == "SES" & Outcome == "TICS Score" & Clock =="GrimAge")$conf.low`, `r filter(DNAmResults, Model == "SES" & Outcome == "TICS Score" & Clock =="GrimAge")$conf.high`; DPoAm $\beta$ = `r filter(DNAmResults, Model == "SES" & Outcome == "TICS Score" & Clock =="DPoAm")$estimate`, 95% CI `r filter(DNAmResults, Model == "SES" & Outcome == "TICS Score" & Clock =="DPoAm")$conf.low`, `r filter(DNAmResults, Model == "SES" & Outcome == "TICS Score" & Clock =="DPoAm")$conf.high`. 
+Coefficient values for TICS change are GrimAge $\beta$ = `r filter(DNAmResults, Model == "SES" & Outcome == "TICS Change" & Clock =="GrimAge")$estimate`, 95% CI `r filter(DNAmResults, Model == "SES" & Outcome == "TICS Change" & Clock =="GrimAge")$conf.low`, `r filter(DNAmResults, Model == "SES" & Outcome == "TICS Change" & Clock =="GrimAge")$conf.high`; DPoAm $\beta$ = `r filter(DNAmResults, Model == "SES" & Outcome == "TICS Change" & Clock =="DPoAm")$estimate`, 95% CI `r filter(DNAmResults, Model == "SES" & Outcome == "TICS Change" & Clock =="DPoAm")$conf.low`, `r filter(DNAmResults, Model == "SES" & Outcome == "TICS Change" & Clock =="DPoAm")$conf.high`.  
+
+Coefficient values for IADL limitation prevalence are GrimAge odds ratio (OR) = `r filter(DNAmResults, Model == "SES" & Outcome == "IADL Prevalence" & Clock =="GrimAge")$estimate`, 95% CI `r filter(DNAmResults, Model == "SES" & Outcome == "IADL Prevalence" & Clock =="GrimAge")$conf.low`, `r filter(DNAmResults, Model == "SES" & Outcome == "IADL Prevalence" & Clock =="GrimAge")$conf.high`; DPoAm OR = `r filter(DNAmResults, Model == "SES" & Outcome == "IADL Prevalence" & Clock =="DPoAm")$estimate`, 95% CI `r filter(DNAmResults, Model == "SES" & Outcome == "IADL Prevalence" & Clock =="DPoAm")$conf.low`, `r filter(DNAmResults, Model == "SES" & Outcome == "IADL Prevalence" & Clock =="DPoAm")$conf.high`.
+Coefficient values for IADL limitation incidence are GrimAge OR = `r filter(DNAmResults, Model == "SES" & Outcome == "IADL Incidence" & Clock =="GrimAge")$estimate`, 95% CI `r filter(DNAmResults, Model == "SES" & Outcome == "IADL Incidence" & Clock =="GrimAge")$conf.low`, `r filter(DNAmResults, Model == "SES" & Outcome == "IADL Incidence" & Clock =="GrimAge")$conf.high`; DPoAm OR = `r filter(DNAmResults, Model == "SES" & Outcome == "IADL Incidence" & Clock =="DPoAm")$estimate`, 95% CI `r filter(DNAmResults, Model == "SES" & Outcome == "IADL Incidence" & Clock =="DPoAm")$conf.low`, `r filter(DNAmResults, Model == "SES" & Outcome == "IADL Incidence" & Clock =="DPoAm")$conf.high`.
+
+## Regression models: magnitude of racial disparities in outcomes
+
+```{r Fig3, fig.height = 4.5, fig.width = 3.4}
+##---------------------------Figure 3----------------------------------------##
+#Plot estimates of Race coefficient for each outcome, clock, and model
+RaceResults <- filter(RegressionResults, term == "RaceBlack")
+
+TICSDisparities <- ggplot(filter(RaceResults, Outcome == "TICS Score" | Outcome == "TICS Change")) +
+  geom_pointrange(aes(y = estimate, ymin = conf.low, ymax = conf.high, x = Clock, linetype = Model, shape = Model, color = Clock),
+                  position = position_dodge(width = 0.4)) +
+  geom_hline(aes(yintercept = 0), size =1) +
+  scale_color_brewer(type= "qual") +
+  scale_shape_manual(values=c(16,1)) +
+  scale_y_reverse() + scale_x_discrete(limits = c("None", "GrimAge","DPoAm")) +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 20, vjust = 0.8)) +
+  labs(x = element_blank(), y = "Beta (TICS points)") +
+  facet_wrap(~factor(Outcome, levels=c("TICS Score","TICS Change")), nrow= 1)
+
+IADLDisparities <- ggplot(filter(RaceResults, Outcome == "IADL Prevalence" | Outcome == "IADL Incidence")) +
+  geom_pointrange(aes(y = estimate, ymin = conf.low, ymax = conf.high, x = Clock, linetype = Model, shape = Model, color = Clock),
+                  position = position_dodge(width = 0.4)) +
+  geom_hline(aes(yintercept = 1), size=1) +
+  scale_color_brewer(type = "qual") +
+  scale_shape_manual(values=c(16,1)) +
+  scale_x_discrete(limits = c("None", "GrimAge","DPoAm")) +
+  labs(x = "Epigenetic age gap included in model", y = "Odds Ratio") +
+  guides(color = FALSE) +
+  theme(legend.position = "bottom", axis.text.x = element_text(angle = 20, vjust = 0.8)) +
+  facet_wrap(~factor(Outcome, levels=c("IADL Prevalence","IADL Incidence")), nrow= 1)
+
+plot_grid(TICSDisparities, IADLDisparities, nrow = 2, rel_heights = c(1, 1.3), align = "v", labels="AUTO")
+ggsave(file = "Fig3.tiff", height = 5, width = 3.4, units = 'in', dpi = 300)
+```
+
+*Fig 3. Racial disparity in outcomes.* Points represent the magnitude of the race coefficient (White being the reference group) and lines represent 95% confidence intervals. Basic models, adjusted for age and gender, are shown with solid points and lines; SES models, which include education and wealth/income, are shown with empty points and dashed lines. The race coefficients with GrimAge gap, DPoAm gap, or neither are shown for A) TICS score and TICS change, B) IADL limitation prevalence and incidence.
+
+In models adjusting for only age and gender, without epigenetic age gap, there are significant racial disparities in all outcomes. Black participants have `r abs(filter(RaceResults, Model == "Basic" & Outcome == "TICS Score" & Clock =="None")$estimate)` (95% CI `r abs(filter(RaceResults, Model == "Basic" & Outcome == "TICS Score" & Clock =="None")$conf.low)`, `r abs(filter(RaceResults, Model == "Basic" & Outcome == "TICS Score" & Clock =="None")$conf.high)`) points lower TICS scores, `r abs(filter(RaceResults, Model == "Basic" & Outcome == "TICS Change" & Clock =="None")$estimate)` (95% CI `r abs(filter(RaceResults, Model == "Basic" & Outcome == "TICS Change" & Clock =="None")$conf.low)`, `r abs(filter(RaceResults, Model == "Basic" & Outcome == "TICS Change" & Clock =="None")$conf.high)`) points more decline in TICS score, `r filter(RaceResults, Model == "Basic" & Outcome == "IADL Prevalence" & Clock =="None")$estimate` (95% CI `r filter(RaceResults, Model == "Basic" & Outcome == "IADL Prevalence" & Clock =="None")$conf.low`, `r filter(RaceResults, Model == "Basic" & Outcome == "IADL Prevalence" & Clock =="None")$conf.high`) times higher odds of prevalence IADL limitation, and `r filter(RaceResults, Model == "Basic" & Outcome == "IADL Incidence" & Clock =="None")$estimate` (95% CI `r filter(RaceResults, Model == "Basic" & Outcome == "IADL Incidence" & Clock =="None")$conf.low`, `r filter(RaceResults, Model == "Basic" & Outcome == "IADL Incidence" & Clock =="None")$conf.high`) times higher odds of incident IADL limitation than White participants. Adding SES to the models decreases the magnitude of disparities in all outcomes and attenuates the disparities in IADL limitation prevalence and incidence to non-significance. Adding GrimAge or DPoAm gap to either the basic or SES model slightly decreases the magnitude of the racial disparities but has a much smaller effect than adding SES to the basic model.
+
+## Mediation models: contribution of epigenetic age gap disparity to disparities in outcomes
+
+```{r TICSsimplemediation, include=FALSE}
+##---------------Mediation for TICS outcomes without SES----------------------##
+#Use cmest function from CMAVerse package for all mediation. Assume no exposure-mediator interaction (EMint = FALSE)
+#I was not able to create a wrapper function
+TICSGrim1 <- cmest(data = epiclocks_complete, model = "gformula", outcome = "TICSperformance", exposure = "Race", mediator = "GrimAge_resid", basec = c("Age", "Gender"), a = "Black", astar = "White", EMint = FALSE, mval = list(0), 
+                     yreg = lm(TICSperformance ~ Race + GrimAge_resid + Age + Gender, epiclocks_complete, weights = VBSI16WGTRA), 
+                     mreg = list(lm(GrimAge_resid ~ Race + Age + Gender, weights = VBSI16WGTRA, data = epiclocks_complete)))
+
+TICSDune1 <- cmest(data = epiclocks_complete, model = "gformula", outcome = "TICSperformance", exposure = "Race", mediator = "DPoAm_resid", basec = c("Age", "Gender"), a = "Black", astar = "White", EMint = FALSE, mval = list(0), 
+                     yreg = lm(TICSperformance ~ Race + DPoAm_resid + Age + Gender, epiclocks_complete, weights = VBSI16WGTRA), 
+                     mreg = list(lm(DPoAm_resid ~ Race + Age + Gender, weights = VBSI16WGTRA, data = epiclocks_complete)))
+
+#TICS Change outcome: use TICS change adjusted for baseline TICS score. Use dataset with only complete cases not missing outcome data
+ChangeGrim1 <- cmest(data = epiclocks_decline, model = "gformula", outcome = "Declineadjusted", exposure = "Race", mediator = "GrimAge_resid", basec = c("Age", "Gender"), a = "Black", astar = "White", EMint = FALSE, mval = list(0), 
+                    yreg = lm(Declineadjusted ~ Age + GrimAge_resid + Gender + Race, epiclocks_decline, weights = VBSI16WGTRA), 
+                    mreg = list(lm(GrimAge_resid ~ Race + Age + Gender, weights = VBSI16WGTRA, data = epiclocks_decline)))
+
+ChangeDune1 <- cmest(data = epiclocks_decline, model = "gformula", outcome = "Declineadjusted", exposure = "Race", mediator = "DPoAm_resid", basec = c("Age", "Gender"), a = "Black", astar = "White", EMint = FALSE, mval = list(0),
+                    yreg = lm(Declineadjusted ~ Age + DPoAm_resid + Gender + Race, epiclocks_decline, weights = VBSI16WGTRA), 
+                    mreg = list(lm(DPoAm_resid ~ Race + Age + Gender, weights = VBSI16WGTRA, data = epiclocks_decline)))
+```
+
+```{r TICSSESMediation, include = FALSE}
+##------------------Mediation for TICS outcomes with SES----------------------##
+#Add education and wealth/income as post-exposure confounders (postc)
+#Use scaled weights because of logistic regressions
+TICSGrim2 <- cmest(data = epiclocks_complete, model = "gformula", outcome = "TICSperformance", exposure = "Race", mediator = "GrimAge_resid", basec = c("Age", "Gender"), postc = c("Education", "IndexAdjusted"), a = "Black", astar = "White", EMint = FALSE, mval = list(0), 
+                     yreg = lm(TICSperformance ~ Race + GrimAge_resid + Age + Gender + Education + IndexAdjusted, epiclocks_complete, weights = ScaleWeights), 
+                     mreg = list(lm(GrimAge_resid ~ Race + Age + Gender + Education + IndexAdjusted, weights = ScaleWeights, data = epiclocks_complete)), 
+                     postcreg = list(glm(Education ~ Race + Age + Gender, family = "binomial", data = epiclocks_complete, weights = ScaleWeights),
+                                glm(IndexAdjusted ~ Race + Age + Gender, family = "binomial", data = epiclocks_complete, weights = ScaleWeights)))
+
+TICSDune2 <- cmest(data = epiclocks_complete, model = "gformula", outcome = "TICSperformance", exposure = "Race", mediator = "DPoAm_resid", basec = c("Age", "Gender"), postc = c("Education", "IndexAdjusted"), a = "Black", astar = "White", EMint = FALSE, mval = list(0), 
+                     yreg = lm(TICSperformance ~ Race + DPoAm_resid + Age + Gender + Education + IndexAdjusted, epiclocks_complete, weights = VBSI16WGTRA), 
+                     mreg = list(lm(DPoAm_resid ~ Race + Age + Gender + Education + IndexAdjusted, weights = VBSI16WGTRA, data = epiclocks_complete)), 
+                     postcreg = list(glm(Education ~ Race + Age + Gender, family = "binomial", data = epiclocks_complete, weights = ScaleWeights),
+                                glm(IndexAdjusted ~ Race + Age + Gender, family = "binomial", data = epiclocks_complete, weights = ScaleWeights)))
+
+ChangeGrim2 <- cmest(data = epiclocks_decline, model = "gformula", outcome = "Declineadjusted", exposure = "Race", mediator = "GrimAge_resid", basec = c("Age", "Gender"), postc = c("Education", "IndexAdjusted"), a = "Black", astar = "White", EMint = FALSE, mval = list(0), 
+                     yreg = lm(Declineadjusted ~ Race + GrimAge_resid + Age + Gender + Education + IndexAdjusted, epiclocks_decline, weights = VBSI16WGTRA), 
+                     mreg = list(lm(GrimAge_resid ~ Race + Age + Gender + Education + IndexAdjusted, weights = VBSI16WGTRA, data = epiclocks_decline)), 
+                     postcreg = list(glm(Education ~ Race + Age + Gender, family = "binomial", data = epiclocks_decline, weights = ScaleWeights),
+                                glm(IndexAdjusted ~ Race + Age + Gender, family = "binomial", data = epiclocks_decline, weights = ScaleWeights)))
+
+ChangeDune2 <- cmest(data = epiclocks_decline, model = "gformula", outcome = "Declineadjusted", exposure = "Race", mediator = "DPoAm_resid", basec = c("Age", "Gender"), postc = c("Education", "IndexAdjusted"), a = "Black", astar = "White", EMint = FALSE, mval = list(0), 
+                     yreg = lm(Declineadjusted ~ Race + DPoAm_resid + Age + Gender + Education + IndexAdjusted, epiclocks_decline, weights = VBSI16WGTRA), 
+                     mreg = list(lm(DPoAm_resid ~ Race + Age + Gender + Education + IndexAdjusted, weights = VBSI16WGTRA, data = epiclocks_decline)), 
+                     postcreg = list(glm(Education ~ Race + Age + Gender, family = "binomial", data = epiclocks_decline, weights = ScaleWeights),
+                                glm(IndexAdjusted ~ Race + Age + Gender, family = "binomial", data = epiclocks_decline, weights = ScaleWeights)))
+```
+
+```{r IADLsimplemediation, include=FALSE}
+##---------------Mediation for IADL outcomes without SES----------------------##
+#Use scaled weights because of logistic regressions
+GrimP <- cmest(data = epiclocks_complete, model = "gformula", outcome = "Prevalence", exposure = "Race", mediator = "GrimAge_resid", basec = c("Age", "Gender"), a = "Black", astar = "White", EMint = FALSE, mval = list(0), 
+                     yreg = glm(Prevalence ~ Race + GrimAge_resid + Age + Gender, family = "binomial", data = epiclocks_complete, weights = ScaleWeights), 
+                     mreg = list(lm(GrimAge_resid ~ Race + Age + Gender, weights = ScaleWeights, data = epiclocks_complete)))
+
+DuneP <- cmest(data = epiclocks_complete, model = "gformula", outcome = "Prevalence", exposure = "Race", mediator = "DPoAm_resid", basec = c("Age", "Gender"), a = "Black", astar = "White", EMint = FALSE, mval = list(0), 
+                     yreg = glm(Prevalence ~ Race + DPoAm_resid + Age + Gender, family = "binomial", data = epiclocks_complete, weights = ScaleWeights), 
+                     mreg = list(lm(DPoAm_resid ~ Race + Age + Gender, weights = ScaleWeights, data = epiclocks_complete)))
+
+#IADL Incidence outcome: Use dataset including only complete cases not missing outcome
+GrimI <- cmest(data = epiclocks_incidence, model = "gformula", outcome = "Incidence", exposure = "Race", mediator = "GrimAge_resid", basec = c("Age", "Gender"), a = "Black", astar = "White", EMint = FALSE, mval = list(0), 
+                    yreg = glm(Incidence ~ Race + GrimAge_resid + Age + Gender, family = "binomial", data = epiclocks_incidence, weights = ScaleWeights), 
+                    mreg = list(lm(GrimAge_resid ~ Race + Age + Gender, weights = ScaleWeights, data = epiclocks_incidence)))
+
+DuneI <- cmest(data = epiclocks_incidence, model = "gformula", outcome = "Incidence", exposure = "Race", mediator = "DPoAm_resid", basec = c("Age", "Gender"), a = "Black", astar = "White", EMint = FALSE, mval = list(0),
+                    yreg = glm(Incidence ~ Race + DPoAm_resid + Age + Gender, family = "binomial", data = epiclocks_incidence, weights = ScaleWeights), 
+                    mreg = list(lm(DPoAm_resid ~ Race + Age + Gender, weights = ScaleWeights, data = epiclocks_incidence)))
+```
+
+```{r IADLmediationwithconfounders, include = FALSE}
+##------------------Mediation for IADL outcomes with SES----------------------##
+GrimPG <- cmest(data = epiclocks_complete, model = "gformula", outcome = "Prevalence", exposure = "Race", mediator = "GrimAge_resid", basec = c("Age", "Gender"), postc = c("Education", "IndexAdjusted"), a = "Black", astar = "White", EMint = FALSE, mval = list(0), 
+                     yreg = glm(Prevalence ~ Race + GrimAge_resid + Age + Gender + Education + IndexAdjusted, family = "binomial", data = epiclocks_complete, weights = ScaleWeights), 
+                     mreg = list(lm(GrimAge_resid ~ Race + Age + Gender + Education + IndexAdjusted, weights = ScaleWeights, data = epiclocks_complete)),
+                postcreg = list(glm(Education ~ Race + Age + Gender, family = "binomial", data = epiclocks_complete, weights = ScaleWeights),
+                                glm(IndexAdjusted ~ Race + Age + Gender, family = "binomial", data = epiclocks_complete, weights = ScaleWeights)))
+
+DunePG <- cmest(data = epiclocks_complete, model = "gformula", outcome = "Prevalence", exposure = "Race", mediator = "DPoAm_resid", basec = c("Age", "Gender"), postc = c("Education", "IndexAdjusted"), a = "Black", astar = "White", EMint = FALSE, mval = list(0), 
+                     yreg = glm(Prevalence ~ Race + DPoAm_resid + Age + Gender + Education + IndexAdjusted, family = "binomial", data = epiclocks_complete, weights = ScaleWeights), 
+               mreg = list(lm(DPoAm_resid ~ Race + Age + Gender + Education + IndexAdjusted, weights = ScaleWeights, data = epiclocks_complete)),
+               postcreg = list(glm(Education ~ Race + Age + Gender, family = "binomial", data = epiclocks_complete, weights = ScaleWeights),
+                                glm(IndexAdjusted ~ Race + Age + Gender, family = "binomial", data = epiclocks_complete, weights = ScaleWeights)))
+
+GrimIG <- cmest(data = epiclocks_incidence, model = "gformula", outcome = "Incidence", exposure = "Race", mediator = "GrimAge_resid", basec = c("Age", "Gender"), postc = c("Education", "IndexAdjusted"), a = "Black", astar = "White", EMint = FALSE, mval = list(0), 
+                    yreg = glm(Incidence ~ Race + GrimAge_resid + Age + Gender + Education + IndexAdjusted, family = "binomial", data = epiclocks_incidence, weights = ScaleWeights), 
+                    mreg = list(lm(GrimAge_resid ~ Race + Age + Gender + Education + IndexAdjusted, weights = ScaleWeights, data = epiclocks_incidence)),
+               postcreg = list(glm(Education ~ Race + Age + Gender, family = "binomial", data = epiclocks_incidence, weights = ScaleWeights),
+                                glm(IndexAdjusted ~ Race + Age + Gender, family = "binomial", data = epiclocks_incidence, weights = ScaleWeights)))
+
+DuneIG <- cmest(data = epiclocks_incidence, model = "gformula", outcome = "Incidence", exposure = "Race", mediator = "DPoAm_resid", basec = c("Age", "Gender"), postc = c("Education", "IndexAdjusted"), a = "Black", astar = "White", EMint = FALSE, mval = list(0),
+                    yreg = glm(Incidence ~ Race + DPoAm_resid + Age + Gender + Education + IndexAdjusted, family = "binomial", data = epiclocks_incidence, weights = ScaleWeights), 
+                    mreg = list(lm(DPoAm_resid ~ Race + Age + Gender + Education + IndexAdjusted, weights = ScaleWeights, data = epiclocks_incidence)),
+               postcreg = list(glm(Education ~ Race + Age + Gender, family = "binomial", data = epiclocks_incidence, weights = ScaleWeights),
+                                glm(IndexAdjusted ~ Race + Age + Gender, family = "binomial", data = epiclocks_incidence, weights = ScaleWeights)))
+```
+
+```{r mediationresults}
+##------------------------Gather mediation results----------------------------##
+#Function to extract relevant values from CMEst object
+CMAResults <- function(CMEST, outcome, clock, model) {
+  as_tibble(CMEST$effect.pe, rownames = "Effect") %>%
+  rename("Estimate" = "value") %>%
+  mutate(CILow = CMEST$effect.ci.low,
+         CIHigh = CMEST$effect.ci.high,
+         StdError = CMEST$effect.se,
+         Pvalue = CMEST$effect.pval,
+         Outcome = outcome,
+         Clock = clock,
+         Model = model)
+}
+#Extract results from each model into tables
+TICSG1 <- CMAResults(TICSGrim1, outcome = "TICS Score", clock = "GrimAge", model = "Basic")
+TICSD1 <- CMAResults(TICSDune1, outcome = "TICS Score", clock = "DPoAm", model = "Basic")
+ChangeG1 <- CMAResults(ChangeGrim1, outcome = "TICS Change", clock = "GrimAge", model = "Basic")
+ChangeD1 <- CMAResults(ChangeDune1, outcome = "TICS Change", clock = "DPoAm", model = "Basic")
+
+TICSG2 <- CMAResults(TICSGrim2, outcome = "TICS Score", clock = "GrimAge", model = "SES")
+TICSD2 <- CMAResults(TICSDune2, outcome = "TICS Score", clock = "DPoAm", model = "SES")
+ChangeG2 <- CMAResults(ChangeGrim2, outcome = "TICS Change", clock = "GrimAge", model = "SES")
+ChangeD2 <- CMAResults(ChangeDune2, outcome = "TICS Change", clock = "DPoAm", model = "SES")
+
+GP1 <- CMAResults(GrimP, outcome = "IADL Prevalence", clock = "GrimAge", model = "Basic")
+DP1 <- CMAResults(DuneP, outcome = "IADL Prevalence", clock = "DPoAm", model = "Basic")
+GI1 <- CMAResults(GrimI, outcome = "IADL Incidence", clock = "GrimAge", model = "Basic")
+DI1 <- CMAResults(DuneI, outcome = "IADL Incidence", clock = "DPoAm", model = "Basic")
+
+GP2 <- CMAResults(GrimPG, outcome = "IADL Prevalence", clock = "GrimAge", model = "SES")
+DP2 <- CMAResults(DunePG, outcome = "IADL Prevalence", clock = "DPoAm", model = "SES")
+GI2 <- CMAResults(GrimIG, outcome = "IADL Incidence", clock = "GrimAge", model = "SES")
+DI2 <- CMAResults(DuneIG, outcome = "IADL Incidence", clock = "DPoAm", model = "SES")
+
+#Combine tables
+MediationResults <- rbind(TICSG1, TICSD1, ChangeG1, ChangeD1, TICSG2, TICSD2, ChangeG2, ChangeD2, GP1, DP1, GI1, DI1, GP2, DP2, GI2, DI2) %>%
+  mutate(Stars = case_when(
+           Pvalue < 0.001 ~ "***",
+           Pvalue < 0.01 ~ "**",
+           Pvalue < 0.05 ~ "*",
+           #Pvalue < 0.1 ~ ".",
+           TRUE ~ ""))
+
+```
+
+```{r mediationtable, results='asis'}
+##-----------------------------Table 2----------------------------------------##
+#Include only total, indirect effects and proportion mediated
+MediationTable <- filter(MediationResults,
+                         grepl("te", Effect) | grepl("tnie", Effect) | grepl("pm", Effect)) %>%
+  mutate(Effect = case_when(
+           grepl("te", Effect) ~ "Total",
+           Effect == "pm" ~ "Mediated",
+           grepl("tnie", Effect) ~ "Indirect"
+           )) %>% 
+  pivot_wider(id_cols = c(Outcome,Effect), names_from = c(Clock, Model), values_from = c(Estimate, CILow, CIHigh, Pvalue, Stars)) %>% 
+  #Use flextable to nicely display the results
+  flextable(col_keys = c("Outcome", "Effect", "GrimAge_Basic",  "GrimAge_SES", "DPoAm_Basic", "DPoAm_SES")) %>%
+  #Merge Estimate, P stars, and CI's into one column
+  compose(j = "GrimAge_Basic", value = as_paragraph(Estimate_GrimAge_Basic, Stars_GrimAge_Basic, "\n(", CILow_GrimAge_Basic, ", ", CIHigh_GrimAge_Basic, ")")) %>%
+  compose(j = "GrimAge_SES", value = as_paragraph(Estimate_GrimAge_SES, Stars_GrimAge_SES, "\n(", CILow_GrimAge_SES, ", ", CIHigh_GrimAge_SES, ")")) %>%
+    compose(j = "DPoAm_Basic", value = as_paragraph(Estimate_DPoAm_Basic, Stars_DPoAm_Basic, "\n(", CILow_DPoAm_Basic, ", ", CIHigh_DPoAm_Basic, ")")) %>%
+  compose(j = "DPoAm_SES", value = as_paragraph(Estimate_DPoAm_SES, Stars_DPoAm_SES, "\n(", CILow_DPoAm_SES, ", ", CIHigh_DPoAm_SES, ")")) %>%
+  #Make outcome labels look nice
+  merge_v(j = ~ Outcome) %>% rotate(j = ~Outcome, rotation = "btlr", align = "center", part = "body") %>%
+  # Add header
+  add_header_row(values = c("","Model:","Basic","SES","Basic","SES"), colwidths = c(1,1,1,1,1,1)) %>%
+  add_header_row(values = c("","Mediator:", "GrimAge","DPoAm"), colwidths = c(1,1,2,2)) %>%
+  # Bold significant mediation effects
+  bold(i = ~ Effect == "Mediated" & Pvalue_GrimAge_Basic < 0.05, j = "GrimAge_Basic") %>%
+  bold(i = ~ Effect == "Mediated" & Pvalue_GrimAge_SES < 0.05, j = "GrimAge_SES") %>%
+  bold(i = ~ Effect == "Mediated" & Pvalue_DPoAm_Basic < 0.05, j = "DPoAm_Basic") %>%
+  bold(i = ~ Effect == "Mediated" & Pvalue_DPoAm_SES < 0.05, j = "DPoAm_SES") %>%
+  #Make appearance nice
+  bold(part = "header") %>% fontsize(size = 10, part = "all") %>% 
+  align(align = "center", part = "all", j = 2:ncol_keys(.)) %>%
+  hline(i = ~ before(Effect, "Indirect"), j = 1:ncol_keys(.)) %>%
+  vline(j = c('Effect', 'GrimAge_SES')) %>%
+  set_caption("Table 2: Mediating effects of epigenetic age gap on racial disparities in outcomes.") %>%
+  add_footer_lines("*p<0.05; **p<0.01; ***p<0.001; (95% Confidence Intervals)") %>%
+  padding(padding.bottom = 4, part = "body") %>%
+  autofit() %>% #makes heights pretty but width too big
+  width(j = 3:ncol_keys(.), width = 0.85)
+  
+MediationTable
+```
+
+*Table 2. Mediating effects of epigenetic age gap on racial disparities in outcomes.* The indirect and total effects and the proportion mediated are shown with 95% confidence intervals. Units of the effects are TICS points for TICS outcomes and odds ratio for IADL outcomes. Proportion mediated is a relative proportion for all outcomes.
+
+GrimAge mediates `r 100*filter(MediationResults, Model == "Basic" & Outcome == "TICS Score" & Clock =="GrimAge" & Effect == "pm")$Estimate`% (95% CI `r 100*filter(MediationResults, Model == "Basic" & Outcome == "TICS Score" & Clock =="GrimAge" & Effect == "pm")$CILow`, `r 100*filter(MediationResults, Model == "Basic" & Outcome == "TICS Score" & Clock =="GrimAge" & Effect == "pm")$CIHigh`) of the disparity in TICS score, 
+`r 100*filter(MediationResults, Model == "Basic" & Outcome == "TICS Change" & Clock =="GrimAge" & Effect == "pm")$Estimate`% (`r 100*filter(MediationResults, Model == "Basic" & Outcome == "TICS Change" & Clock =="GrimAge" & Effect == "pm")$CILow`, `r 100*filter(MediationResults, Model == "Basic" & Outcome == "TICS Change" & Clock =="GrimAge" & Effect == "pm")$CIHigh`) of the disparity in TICS change, 
+`r 100*filter(MediationResults, Model == "Basic" & Outcome == "IADL Prevalence" & Clock =="GrimAge" & Effect == "pm")$Estimate`% (`r 100*filter(MediationResults, Model == "Basic" & Outcome == "IADL Prevalence" & Clock =="GrimAge" & Effect == "pm")$CILow`, `r 100*filter(MediationResults, Model == "Basic" & Outcome == "IADL Prevalence" & Clock =="GrimAge" & Effect == "pm")$CIHigh`) of the disparity in IADL limitation prevalence, and 
+`r 100*filter(MediationResults, Model == "Basic" & Outcome == "IADL Incidence" & Clock =="GrimAge" & Effect == "pm")$Estimate`% (`r 100*filter(MediationResults, Model == "Basic" & Outcome == "IADL Incidence" & Clock =="GrimAge" & Effect == "pm")$CILow`, `r 100*filter(MediationResults, Model == "Basic" & Outcome == "IADL Incidence" & Clock =="GrimAge" & Effect == "pm")$CIHigh`) of the disparity in IADL limitation incidence. 
+DPoAm mediates `r 100*filter(MediationResults, Model == "Basic" & Outcome == "TICS Score" & Clock =="DPoAm" & Effect == "pm")$Estimate`% (`r 100*filter(MediationResults, Model == "Basic" & Outcome == "TICS Score" & Clock =="DPoAm" & Effect == "pm")$CILow`, `r 100*filter(MediationResults, Model == "Basic" & Outcome == "TICS Score" & Clock =="DPoAm" & Effect == "pm")$CIHigh`) of the disparity in TICS score, 
+`r 100*filter(MediationResults, Model == "Basic" & Outcome == "TICS Change" & Clock =="DPoAm" & Effect == "pm")$Estimate`% (`r 100*filter(MediationResults, Model == "Basic" & Outcome == "TICS Change" & Clock =="DPoAm" & Effect == "pm")$CILow`, `r 100*filter(MediationResults, Model == "Basic" & Outcome == "TICS Change" & Clock =="DPoAm" & Effect == "pm")$CIHigh`) of the disparity in TICS change, 
+`r 100*filter(MediationResults, Model == "Basic" & Outcome == "IADL Prevalence" & Clock =="DPoAm" & Effect == "pm")$Estimate`% (`r 100*filter(MediationResults, Model == "Basic" & Outcome == "IADL Prevalence" & Clock =="DPoAm" & Effect == "pm")$CILow`, `r 100*filter(MediationResults, Model == "Basic" & Outcome == "IADL Prevalence" & Clock =="DPoAm" & Effect == "pm")$CIHigh`) of the disparity in IADL limitation prevalence, and 
+`r 100*filter(MediationResults, Model == "Basic" & Outcome == "IADL Incidence" & Clock =="DPoAm" & Effect == "pm")$Estimate`% (`r 100*filter(MediationResults, Model == "Basic" & Outcome == "IADL Incidence" & Clock =="DPoAm" & Effect == "pm")$CILow`, `r 100*filter(MediationResults, Model == "Basic" & Outcome == "IADL Incidence" & Clock =="DPoAm" & Effect == "pm")$CIHigh`) of the disparity in IADL limitation incidence. 
+
+Adding education and wealth/income as post-exposure confounders attenuates mediating effects for the TICS outcomes. Only the mediating effect of GrimAge gap for TICS score remains significant (`r 100*filter(MediationResults, Model == "SES" & Outcome == "TICS Score" & Clock =="GrimAge" & Effect == "pm")$Estimate`%, `r 100*filter(MediationResults, Model == "SES" & Outcome == "TICS Score" & Clock =="GrimAge" & Effect == "pm")$CILow`, `r 100*filter(MediationResults, Model == "SES" & Outcome == "TICS Score" & Clock =="GrimAge" & Effect == "pm")$CIHigh`).
+
+# Supplemental Material
+
+```{r TableMissing, include = FALSE}
+tbl_summary(epiclocks_complete, by = MissingTICSChange, include = c(TICSperformance, GrimAge_resid, DPoAm_resid, Race, Age, Gender, Education, IndexAdjusted), label = Labels,
+            type = list(where(is.numeric) ~ "continuous"), statistic = list(all_continuous() ~ "{mean} ({sd})"), digits = list(all_continuous() ~ 2)) %>% 
+  add_overall() %>% add_p() %>% bold_labels() %>%
+  modify_caption("Missing vs not missing 2018 TICS data") %>%
+  as_flex_table() %>% bold(part = "header") %>% fontsize(size = 10, part = "all") 
+
+tbl_summary(filter(epiclocks_complete, !IADLprevalence), by = MissingIncidence, include = c(GrimAge_resid, DPoAm_resid, Race, Age, Gender, Education, IndexAdjusted), label = Labels,
+            type = list(where(is.numeric) ~ "continuous"), statistic = list(all_continuous() ~ "{mean} ({sd})"), digits = list(all_continuous() ~ 2)) %>% 
+  add_overall() %>% add_p() %>% bold_labels() %>%
+  modify_caption("Missing vs not missing 2018 IADL data") %>%
+  as_flex_table() %>% bold(part = "header") %>% fontsize(size = 10, part = "all") 
+```
+
+```{r Tablefunctions}
+##----------------------Set up for tables of regression results--------------##
+LinearTable <- function(Model, LabelList, ColumnHeader, IncludeList = everything(), StatLabel = "Beta (95% CI)"){
+  tbl_regression(Model, intercept = TRUE, label = LabelList, include = all_of(IncludeList), show_single_row = c("Race", "Gender")) %>%
+    add_glance_table(include = c(r.squared, AIC, nobs)) %>%
+    #add_vif() %>%
+    bold_labels() %>% modify_header(estimate = ColumnHeader, label = StatLabel)
+}
+LogTable <- function(Model, LabelList, ColumnHeader, StatLabel = "Odds Ratio (95% CI)", IncludeList = everything()){
+  tbl_regression(Model, intercept = TRUE, label = LabelList, include = all_of(IncludeList), exponentiate = TRUE, show_single_row = c("Race", "Gender"), tidy_fun = broom.helpers::tidy_parameters) %>%
+    add_glance_table(include = c(null.deviance, AIC, nobs)) %>%
+    #add_vif() %>%
+    bold_labels() %>% modify_header(estimate = ColumnHeader, label = StatLabel)
+}
+MergeTables <- function(TablesList, header = FALSE, title = "") {
+    tbl_merge(TablesList, tab_spanner = header) %>%
+    #rearrange so that intercept and stats on bottom
+    modify_table_body(~.x %>% arrange(label == "(Intercept)")) %>%
+    modify_table_body(~.x %>% arrange(row_type == "glance_statistic")) %>%
+    modify_footnote(everything() ~ "*p<0.05; **p<0.01; ***p<0.001") %>%
+    modify_caption(title)
+}
+FlexTable <- function(SummaryTable) {
+    as_flex_table(SummaryTable) %>% bold(part = "header") %>% 
+    fontsize(size = 10, part = "all") %>% 
+    fontsize(size = 8, part = "footer") %>%
+    hline(i = ~ label %in% "(Intercept)") %>%
+    autofit() %>% #makes heights pretty but width too big
+    width(j = 2:ncol_keys(.), width = 0.81) # width to make it pretty.
+}
+
+RegressionLabels <- list('Age' ~ "Age", 'Gender' ~ "Gender (Female)", 'Race' ~ "Race (Black)", contains('TICSperformance') ~ "TICS score", contains('[[clock]]') ~ "Epigenetic age gap", contains('resid') ~ "Epigenetic age gap", contains('Index') ~ "Wealth/Income Quartile",
+               contains('Activity') ~ "Physical activity frequency", contains('Smoke') ~ "Tobacco smoking", contains('Drink') ~ "Alcohol consumption", contains('CESD') ~ "Depression symptoms", contains('Chronic') ~ "# Chronic conditions", contains('SelfRatedHealth') ~ "Self-rated health")
+```
+
+```{r TICSprimarymodels}
+##------------------------Supplement Table 1----------------------------------##
+TICSmodel0 <- lm(TICSperformance ~ Age + Gender + Race, epiclocks_complete, weights = VBSI16WGTRA)
+TICSmodel1 <- update(TICSmodel0, . ~ . + Education + IndexAdjusted)
+TICStbl_0 <- LinearTable(TICSmodel0, RegressionLabels, "Basic")
+TICStbl_1 <- LinearTable(TICSmodel1, RegressionLabels, "SES")
+
+TICSPerformance <- function(clock) {
+  model1 <- lm(TICSperformance ~ Age + Gender + Race + epiclocks_complete[[clock]], epiclocks_complete, weights = VBSI16WGTRA)
+  model2 <- update(model1, . ~ . + Education + IndexAdjusted)
+
+  clock_name <- gsub("_resid","",clock)
+  tbl_1 <- LinearTable(model1, RegressionLabels, paste("Basic + ", clock_name))
+  tbl_2 <- LinearTable(model2, RegressionLabels, paste("SES + ", clock_name))
+
+MergeTables(list(tbl_1, tbl_2))
+}
+MergeTables(list(TICStbl_0, TICStbl_1, TICSPerformance("GrimAge_resid"), TICSPerformance("DPoAm_resid")), title = "eTable 1: Basic and SES regression models with TICS score outcome") %>%
+  FlexTable()
+##------------------------Supplement Table 2----------------------------------##
+Changemodel0 <- lm(TICSdifference ~ Age + Gender + Race + TICSperformance, epiclocks_complete, weights = VBSI16WGTRA)
+Changemodel1 <- update(Changemodel0, . ~ . + Education + IndexAdjusted)
+Changetbl_0 <- LinearTable(Changemodel0, RegressionLabels, "Basic")
+Changetbl_1 <- LinearTable(Changemodel1, RegressionLabels, "SES")
+
+TICSDecline <- function(clock) {
+  model1 <- lm(TICSdifference ~ Age + Gender + Race + TICSperformance + epiclocks_complete[[clock]], epiclocks_complete, weights = VBSI16WGTRA)
+  model2 <- update(model1, . ~ . + Education + IndexAdjusted)
+  
+  clock_name <- gsub("_resid","",clock)
+  tbl_1 <- LinearTable(model1, RegressionLabels, paste("Basic + ", clock_name))
+  tbl_2 <- LinearTable(model2, RegressionLabels, paste("SES + ", clock_name))
+
+MergeTables(list(tbl_1, tbl_2))
+}
+
+MergeTables(list(Changetbl_0, Changetbl_1, TICSDecline("GrimAge_resid"), TICSDecline("DPoAm_resid")), title = "eTable 2: Basic and SES regression models with TICS change outcome") %>%
+  FlexTable()
+```
+
+```{r IADLprimarymodels}
+##--------------------Functions for IADL regressions--------------------------##
+IADLModels <- function(clock = "None", outcome) {
+  if(outcome == "prevalence") {
+  Model0 <- svyglm(IADLprevalence ~ Age + Gender + Race, design = Design, family = "binomial")
+  }
+    if(outcome == "incidence") {
+  Model0 <- svyglm(IADLincidence ~ Age + Gender + Race, design = Design, family = "binomial", na.action = na.omit)
+  }
+  Model1 <- update(Model0, . ~ . + Education + IndexAdjusted)
+  
+  if(clock == "None") {
+    tbl0 <- LogTable(Model0, RegressionLabels, "Basic")
+    tbl1 <- LogTable(Model1, RegressionLabels, "SES") 
+    List <- list(tbl0,tbl1)
+  }  
+  
+  if(clock != "None") {
+    Update <- paste(". ~ . + ", clock)
+    Clock0 <- update(Model0, Update)
+    Clock1 <- update(Model1, Update)
+    clock_name <- gsub("_resid","",clock)
+    tbl0 <- LogTable(Clock0, RegressionLabels, paste("Basic + ",clock_name))
+    tbl1 <- LogTable(Clock1, RegressionLabels, paste("SES + ",clock_name))
+    List <- list(tbl0, tbl1)
+  }
+  MergeTables(List)
+}
+##------------------------Supplement Table 3----------------------------------##
+MergeTables(list(IADLModels("None", "prevalence"), IADLModels("GrimAge_resid", "prevalence"), IADLModels("DPoAm_resid", "prevalence")), title = "eTable 3: Basic and SES regression models with IADL prevalence outcome") %>%
+  FlexTable()
+##------------------------Supplement Table 4----------------------------------##
+MergeTables(list(IADLModels("None", "incidence"), IADLModels("GrimAge_resid", "incidence"), IADLModels("DPoAm_resid", "incidence")), title = "eTable 4: Basic and SES regression models with IADL incidence outcome") %>%
+  FlexTable()
+```
+
+
+```{r TableS5}
+##------------------------Supplement Table 5----------------------------------##
+tbl_summary(epiclocks_complete, by = Race, include = c(Smoke, Drink, Activity, SelfRatedHealth, CESD, Chronic6, Stroke), label = Labels,
+            type = list(where(is.numeric) ~ "continuous"), statistic = list(all_continuous() ~ "{mean} ({sd})"), digits = list(all_continuous() ~ 2)) %>% 
+  add_overall() %>% add_p() %>% bold_labels() %>% 
+  add_stat(fns = list(all_continuous() ~ CohensD, all_categorical() ~ CramersV)) %>% modify_header(add_stat_1 ~ "Effect Size") %>% modify_footnote(add_stat_1 ~ "Cohen's D; Cramer's V") %>%
+  modify_caption("eTable 5: Health characteristics by race") %>%
+  as_flex_table() %>% bold(part = "header") %>% fontsize(size = 10, part = "all")
+```
+
+```{r TICSsupplementmodels}
+##------------------------Supplement Table 6----------------------------------##
+TICScovariatemodels <- function(clock) {
+  Performance1 <- lm(TICSperformance ~ epiclocks_complete[[clock]] + Age + Gender + Race + Education + IndexAdjusted + Smoke + Drink + Activity, epiclocks_complete, weights = VBSI16WGTRA)
+  Performance2 <- update(Performance1, . ~ . + SelfRatedHealth + CESD + Chronic6 + Stroke)
+  Decline1 <- lm(TICSdifference ~ epiclocks_complete[[clock]] + Age + Gender + Race + Education + IndexAdjusted + TICSperformance + Smoke + Drink + Activity, epiclocks_complete, weights = VBSI16WGTRA)
+  Decline2 <- update(Decline1, . ~ . + SelfRatedHealth + CESD + Chronic6 + Stroke)
+  
+  tbl_1 <- LinearTable(Performance1, RegressionLabels, "+ Behaviors")
+  tbl_2 <- LinearTable(Performance2, RegressionLabels, "+ Health Status")
+  tbl_3 <- LinearTable(Decline1, RegressionLabels, "+ Behaviors")
+  tbl_4 <- LinearTable(Decline2, RegressionLabels, "+ Health Status")
+
+MergeTables(list(tbl_1, tbl_2, tbl_3, tbl_4), header = c("TICS Score", "TICS Score", "TICS Change", "TICS Change"))
+}
+
+MergeTables(list(TICScovariatemodels("GrimAge_resid"), TICScovariatemodels("DPoAm_resid")), title = "Table e6: Health behavior and status models for TICS outcomes") %>%
+  FlexTable() %>% add_header_row(values = c("","GrimAge","DPoAm"), colwidths = c(1,4,4)) %>%
+  vline(j = 5)
+```
+
+```{r IADLsupplementmodels}
+##------------------------Supplement Table 7----------------------------------##
+IADLCovariates <- function(clock, outcome) {
+  Formula1 <- paste(outcome, " ~ ", clock, " + Age + Gender + Race + Education + IndexAdjusted + Smoke + Drink + Activity")
+  Model1 <- svyglm(Formula1, design = Design, family = "binomial")
+  Model2 <- update(Model1, . ~ . + SelfRatedHealth + CESD + Chronic6 + Stroke)
+  
+  tbl1 <- LogTable(Model1, RegressionLabels, "+ Behaviors")
+  tbl2 <- LogTable(Model2, RegressionLabels, "+ Health Status")
+  MergeTables(list(tbl1,tbl2))
+}
+  
+MergeTables(list(IADLCovariates("GrimAge_resid", "IADLprevalence"), IADLCovariates("GrimAge_resid", "IADLincidence"), IADLCovariates("DPoAm_resid", "IADLprevalence"), IADLCovariates("DPoAm_resid", "IADLincidence")), title = "eTable 7: Health behavior and status models for IADL outcomes", header = c("Prevalence","Incidence","Prevalence","Incidence")) %>%
+  FlexTable() %>% add_header_row(values = c("","GrimAge","DPoAm"), colwidths = c(1,4,4)) %>%
+  vline(j = 5)
+```
+
+```{r mediationfullresults}
+##------------------------Supplement Table 8----------------------------------##
+FullMediationTable <- mutate(MediationResults,
+         Effect = case_when(
+           grepl("cde", Effect) ~ "Controlled Direct",
+           grepl("te", Effect) ~ "Total",
+           Effect == "pm" ~ "Mediated",
+           grepl("pnde", Effect) ~ "Pure Natural Direct",
+           grepl("pnie", Effect) ~ "Pure Natural Indirect",
+           grepl("tnde", Effect) ~ "Total Natural Direct",
+           grepl("tnie", Effect) ~ "Total Natural Indirect"
+           )) %>% 
+  pivot_wider(id_cols = c(Outcome,Effect), names_from = c(Clock, Model), values_from = c(Estimate, CILow, CIHigh, Pvalue, Stars)) %>% 
+  #Use flextable to nicely display the results
+  flextable(col_keys = c("Outcome", "Effect", "GrimAge_Basic",  "GrimAge_SES", "DPoAm_Basic", "DPoAm_SES")) %>%
+  #Merge Estimate, P stars, and CI's into one column
+  compose(j = "GrimAge_Basic", value = as_paragraph(Estimate_GrimAge_Basic, Stars_GrimAge_Basic, "\n(", CILow_GrimAge_Basic, ", ", CIHigh_GrimAge_Basic, ")")) %>%
+  compose(j = "GrimAge_SES", value = as_paragraph(Estimate_GrimAge_SES, Stars_GrimAge_SES, "\n(", CILow_GrimAge_SES, ", ", CIHigh_GrimAge_SES, ")")) %>%
+    compose(j = "DPoAm_Basic", value = as_paragraph(Estimate_DPoAm_Basic, Stars_DPoAm_Basic, "\n(", CILow_DPoAm_Basic, ", ", CIHigh_DPoAm_Basic, ")")) %>%
+  compose(j = "DPoAm_SES", value = as_paragraph(Estimate_DPoAm_SES, Stars_DPoAm_SES, "\n(", CILow_DPoAm_SES, ", ", CIHigh_DPoAm_SES, ")")) %>%
+  #Make outcome labels look nice
+  merge_v(j = ~ Outcome) %>% rotate(j = ~Outcome, rotation = "btlr", align = "center", part = "body") %>%
+  #Add spanning headers
+  add_header_row(values = c("","Model:","Basic","SES","Basic","SES"), colwidths = c(1,1,1,1,1,1)) %>%
+  add_header_row(values = c("","Mediator:", "GrimAge","DPoAm"), colwidths = c(1,1,2,2)) %>%
+  #Format appearance
+  bold(part = "header") %>% 
+  align(align = "center", part = "all", j = 2:ncol_keys(.)) %>%
+  fontsize(size = 10, part = "all") %>% 
+  hline(i = ~ before(Effect, "Controlled Direct"), j = 1:ncol_keys(.)) %>%
+  vline(j = c('Effect', 'GrimAge_SES')) %>%
+  set_caption("eTable 8: Full mediation results.") %>%
+  add_footer_lines("*p<0.05; **p<0.01; ***p<0.001; (95% Confidence Intervals)") %>%
+  padding(padding.bottom = 4, part = "body") %>%
+  autofit() %>% #makes heights pretty but width too big
+  width(j = 3:ncol_keys(.), width = 0.84)
+  
+ FullMediationTable
+```
+
