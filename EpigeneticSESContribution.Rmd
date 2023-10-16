@@ -6,17 +6,18 @@ output:
   word_document: default
 ---
 
-This code was used to produce the analyses and results in paper: [medrxiv link]
+This code was used to produce the analyses and results in paper: https://www.medrxiv.org/content/10.1101/2023.09.29.23296351v1
 
 Data can be downloaded from the Health and Retirement Study website: https://hrs.isr.umich.edu/data-products
 
 Data folders needed:
-- randhrs1992_2020v1_SPSS https://hrsdata.isr.umich.edu/data-products/rand-hrs-longitudinal-file-2020
-- trk2020v3 https://hrsdata.isr.umich.edu/data-products/cross-wave-tracker-file 
-- CogImp2020 https://hrsdata.isr.umich.edu/data-products/cross-wave-imputation-cognitive-functioning-measures-1992-2020 
-- EPIGENETIC https://hrsdata.isr.umich.edu/data-products/epigenetic-clocks 
 
-Make sure to set working directory (line 67) before knitting
+* randhrs1992_2020v1_SPSS https://hrsdata.isr.umich.edu/data-products/rand-hrs-longitudinal-file-2020
+* trk2020v3 https://hrsdata.isr.umich.edu/data-products/cross-wave-tracker-file 
+* CogImp2020 https://hrsdata.isr.umich.edu/data-products/cross-wave-imputation-cognitive-functioning-measures-1992-2020 
+* EPIGENETIC https://hrsdata.isr.umich.edu/data-products/epigenetic-clocks 
+
+Make sure to set working directory (line 73) before knitting
 
 ```{r setup, include=FALSE}
 RequiredPackages <- c("tidyverse","haven","knitr","gtsummary","flextable","Hmisc","modelr","survey","cowplot","lsr","broom", "ggdag")
